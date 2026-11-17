@@ -46,7 +46,7 @@ class Mp4CacheExporter {
     final segmentFiles = <File>[];
     for (var startRange = 0;
         startRange < contentLength;
-        startRange += Config.segmentSize) {
+        startRange = Config.segmentEndOf(startRange)) {
       final endRange = _segmentEndRange(startRange, contentLength);
       final task = await _segmentTask(
         uri,
@@ -177,7 +177,7 @@ class Mp4CacheExporter {
   }
 
   int _segmentEndRange(int startRange, int contentLength) {
-    final endRange = startRange + Config.segmentSize - 1;
+    final endRange = Config.segmentEndOf(startRange) - 1;
     final lastByte = contentLength - 1;
     return endRange > lastByte ? lastByte : endRange;
   }

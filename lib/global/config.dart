@@ -35,6 +35,40 @@ class Config {
   /// The size of each data segment (in bytes) for chunked operations.
   static int segmentSize = 2000000;
 
+  /// When set (> 0 and < [segmentSize]), the first [segmentSize] bytes of a
+  /// file are split into segments of this size for faster first-byte delivery;
+  /// everything past [segmentSize] stays [segmentSize]-aligned. 0 = uniform.
+  static int firstSegmentSize = 0;
+
+  static bool get _hybrid =>
+      firstSegmentSize > 0 && firstSegmentSize < segmentSize;
+
+  /// Start of the segment containing [position].
+  static int segmentStartOf(int position) {
+    final unit = _hybrid && position < segmentSize
+        ? firstSegmentSize
+        : segmentSize;
+    return position - position % unit;
+  }
+
+  /// End (exclusive) of the segment starting at [start].
+  static int segmentEndOf(int start) {
+    if (_hybrid && start < segmentSize) {
+      final end = start + firstSegmentSize;
+      return end < segmentSize ? end : segmentSize;
+    }
+    return start + segmentSize;
+  }
+
+  /// Number of segments covering a file of [contentLength] bytes.
+  static int segmentCount(int contentLength) {
+    var count = 0;
+    for (var start = 0; start < contentLength; start = segmentEndOf(start)) {
+      count++;
+    }
+    return count;
+  }
+
   /// A custom cache identifier string.
   static String customCacheId = 'Custom-Cache-ID';
 }

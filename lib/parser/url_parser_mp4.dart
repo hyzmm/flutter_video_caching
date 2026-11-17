@@ -173,9 +173,8 @@ class UrlParserMp4 implements UrlParser {
     await socket.append(responseHeaders.join('\r\n'));
 
     bool downloading = true;
-    int startRange =
-        requestRangeStart - (requestRangeStart % Config.segmentSize);
-    int endRange = startRange + Config.segmentSize - 1;
+    int startRange = Config.segmentStartOf(requestRangeStart);
+    int endRange = Config.segmentEndOf(startRange) - 1;
     int retry = 3;
     while (downloading) {
       // The last segment's endRange must not exceed the file's last byte. When
@@ -239,8 +238,8 @@ class UrlParserMp4 implements UrlParser {
       });
       bool success = await socket.append(data);
       if (!success) downloading = false;
-      startRange += Config.segmentSize;
-      endRange = startRange + Config.segmentSize - 1;
+      startRange = Config.segmentEndOf(startRange);
+      endRange = Config.segmentEndOf(startRange) - 1;
       if (startRange > requestRangeEnd) {
         downloading = false;
       }
@@ -274,9 +273,8 @@ class UrlParserMp4 implements UrlParser {
     await socket.append(responseHeaders.join('\r\n'));
 
     bool downloading = true;
-    int startRange =
-        rangeResponse.start - (rangeResponse.start % Config.segmentSize);
-    int endRange = startRange + Config.segmentSize - 1;
+    int startRange = Config.segmentStartOf(rangeResponse.start);
+    int endRange = Config.segmentEndOf(startRange) - 1;
     int retry = 3;
     while (downloading) {
       // The last segment's endRange must not exceed the file's last byte. When
@@ -337,8 +335,8 @@ class UrlParserMp4 implements UrlParser {
       });
       bool success = await socket.append(data);
       if (!success) downloading = false;
-      startRange += Config.segmentSize;
-      endRange = startRange + Config.segmentSize - 1;
+      startRange = Config.segmentEndOf(startRange);
+      endRange = Config.segmentEndOf(startRange) - 1;
       if (startRange > rangeResponse.end) {
         downloading = false;
       }
@@ -354,11 +352,11 @@ class UrlParserMp4 implements UrlParser {
     Map<String, String> headers,
     int requestRangeStart,
   ) async {
-    final start = requestRangeStart - requestRangeStart % Config.segmentSize;
+    final start = Config.segmentStartOf(requestRangeStart);
     final task = DownloadTask(
       uri: uri,
       startRange: start,
-      endRange: start + Config.segmentSize - 1,
+      endRange: Config.segmentEndOf(start) - 1,
       headers: headers,
       // Same boost the serve loop applies to the segment it is waiting on.
       priority: 3,
@@ -461,7 +459,7 @@ class UrlParserMp4 implements UrlParser {
         .where((e) => e.url == newTask.url)
         .length;
     while (activeSize < 2) {
-      final nextStartRange = newTask.startRange + Config.segmentSize;
+      final nextStartRange = Config.segmentEndOf(newTask.startRange);
       // Bail when the total length is unknown (head failed) or the next segment
       // would start past EOF. Without the `contentLength <= 0` guard a failed
       // head leaves no upper bound, so an all-cached tail spins this loop
@@ -520,18 +518,19 @@ class UrlParserMp4 implements UrlParser {
       await _cacheContentLength(contentLengthTask, contentLength);
     }
     if (contentLength > 0) {
-      int segmentSize = contentLength ~/ Config.segmentSize +
-          (contentLength % Config.segmentSize > 0 ? 1 : 0);
+      int segmentSize = Config.segmentCount(contentLength);
       if (cacheSegments > segmentSize) {
         cacheSegments = segmentSize;
       }
     }
     int count = 0;
+    int startRange = 0;
     while (count < cacheSegments) {
       DownloadTask task = DownloadTask(uri: url.toSafeUri(), headers: headers);
       // Set the start and end range for each segment
-      task.startRange += Config.segmentSize * count;
-      task.endRange = task.startRange + Config.segmentSize - 1;
+      task.startRange = startRange;
+      task.endRange = Config.segmentEndOf(startRange) - 1;
+      startRange = Config.segmentEndOf(startRange);
       count++;
       Uint8List? data = await cache(task);
       if (data == null) return false;
@@ -540,7 +539,7 @@ class UrlParserMp4 implements UrlParser {
   }
 
   int _segmentEndRange(int startRange, int contentLength) {
-    final endRange = startRange + Config.segmentSize - 1;
+    final endRange = Config.segmentEndOf(startRange) - 1;
     if (contentLength <= 0) return endRange;
     final lastByte = contentLength - 1;
     return endRange > lastByte ? lastByte : endRange;
@@ -576,8 +575,7 @@ class UrlParserMp4 implements UrlParser {
       await _cacheContentLength(contentLengthTask, contentLength);
     }
     if (contentLength > 0) {
-      int segmentSize = contentLength ~/ Config.segmentSize +
-          (contentLength % Config.segmentSize > 0 ? 1 : 0);
+      int segmentSize = Config.segmentCount(contentLength);
       if (cacheSegments > segmentSize) {
         cacheSegments = segmentSize;
       }
@@ -585,14 +583,16 @@ class UrlParserMp4 implements UrlParser {
     int downloadedSize = 0;
     int totalSize = cacheSegments;
     int count = 0;
+    int startRange = 0;
     while (count < cacheSegments) {
       DownloadTask task = DownloadTask(
         uri: uri,
         headers: headers,
         priority: priority,
       );
-      task.startRange += Config.segmentSize * count;
-      task.endRange = task.startRange + Config.segmentSize - 1;
+      task.startRange = startRange;
+      task.endRange = Config.segmentEndOf(startRange) - 1;
+      startRange = Config.segmentEndOf(startRange);
       count++;
       if (downloadNow) {
         Uint8List? data = await cache(task);
