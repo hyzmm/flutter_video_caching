@@ -8,7 +8,6 @@ import 'package:synchronized/synchronized.dart';
 
 import '../cache/lru_cache_singleton.dart';
 import '../ext/file_ext.dart';
-import '../ext/gesture_ext.dart';
 import '../ext/log_ext.dart';
 import 'download_status.dart';
 import 'download_task.dart';
@@ -115,7 +114,9 @@ class DownloadPool {
     } else if (existTask == null) {
       await addTask(task);
     }
-    FunctionProxy.debounce(roundTask);
+    // Schedule immediately: roundTask is lock-serialized, and the old 500ms
+    // trailing debounce delayed every download start (visible first-frame lag).
+    unawaited(roundTask());
     return task;
   }
 
@@ -131,7 +132,7 @@ class DownloadPool {
     if (existingTask.status == DownloadStatus.PAUSED) {
       existingTask.status = DownloadStatus.IDLE;
     }
-    FunctionProxy.debounce(roundTask);
+    unawaited(roundTask());
   }
 
   void updateTaskById(String taskId, DownloadStatus status) {
@@ -298,10 +299,10 @@ class DownloadPool {
     await tmpFile.rename(task.savePath);
     task.progress = 1;
     task.data = saveFile.readAsBytesSync();
-    updateTaskById(task.id, DownloadStatus.COMPLETED);
     try {
-      // Cache registration is an optimization after the network download has
-      // succeeded. Do not turn cache bookkeeping failures into download errors.
+      // Register the cache before announcing COMPLETED (which also removes the
+      // task from the list): a serve loop polling between the two would see
+      // "no task, no cache" and re-download the whole segment.
       await LruCacheSingleton().memoryPut(
         task.matchUrl,
         Uint8List.fromList(task.data),
@@ -310,9 +311,10 @@ class DownloadPool {
     } catch (e) {
       logE('[DownloadPool] Cache registration failed: $e');
     }
+    updateTaskById(task.id, DownloadStatus.COMPLETED);
     int duration = DateTime.now().difference(startTime).inSeconds;
     logV('[DownloadPool] Download done time: $duration s: ${task.toString()}');
-    FunctionProxy.debounce(roundTask);
+    unawaited(roundTask());
   }
 
   void _downloadError(DownloadTask task, dynamic error) {
@@ -338,7 +340,7 @@ class DownloadPool {
         task.retryTimes--;
         _download(task);
       }
-      FunctionProxy.debounce(roundTask);
+      unawaited(roundTask());
     }
   }
 

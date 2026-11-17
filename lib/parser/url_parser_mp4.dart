@@ -145,6 +145,9 @@ class UrlParserMp4 implements UrlParser {
     int requestRangeEnd,
     Map<String, String> headers,
   ) async {
+    // Start the first segment before the HEAD round-trip so the two overlap;
+    // otherwise the player waits an extra origin RTT before any byte arrives.
+    await _warmFirstSegment(uri, headers, requestRangeStart);
     DownloadTask task = DownloadTask(
       uri: uri,
       startRange: 0,
@@ -203,7 +206,7 @@ class UrlParserMp4 implements UrlParser {
       bool exitUri = VideoProxy.downloadManager.isTaskExit(task);
       if (exitUri) {
         while (data == null) {
-          await Future.delayed(const Duration(milliseconds: 100));
+          await Future.delayed(const Duration(milliseconds: 20));
           data = await cache(task);
         }
       }
@@ -256,6 +259,7 @@ class UrlParserMp4 implements UrlParser {
     bool partial,
     Map<String, String> headers,
   ) async {
+    await _warmFirstSegment(uri, headers, requestRangeStart);
     final totalContentLength = await _contentLength(uri, headers);
     final rangeResponse = Mp4RangeResponse.fromRequest(
       start: requestRangeStart,
@@ -300,7 +304,7 @@ class UrlParserMp4 implements UrlParser {
       bool exitUri = VideoProxy.downloadManager.isTaskExit(task);
       if (exitUri) {
         while (data == null) {
-          await Future.delayed(const Duration(milliseconds: 100));
+          await Future.delayed(const Duration(milliseconds: 20));
           data = await cache(task);
         }
       }
@@ -339,6 +343,29 @@ class UrlParserMp4 implements UrlParser {
         downloading = false;
       }
     }
+  }
+
+  /// Submits the segment containing [requestRangeStart] for download unless it
+  /// is already cached, so the download overlaps the HEAD/content-length probe.
+  /// The end range is unclamped (total length is not known yet); for files
+  /// smaller than one segment the serve loop re-requests the clamped range.
+  Future<void> _warmFirstSegment(
+    Uri uri,
+    Map<String, String> headers,
+    int requestRangeStart,
+  ) async {
+    final start = requestRangeStart - requestRangeStart % Config.segmentSize;
+    final task = DownloadTask(
+      uri: uri,
+      startRange: start,
+      endRange: start + Config.segmentSize - 1,
+      headers: headers,
+      // Same boost the serve loop applies to the segment it is waiting on.
+      priority: 3,
+    );
+    if (await cache(task) != null) return;
+    task.cacheDir = await FileExt.createCachePath(uri.generateMd5);
+    unawaited(VideoProxy.downloadManager.executeTask(task));
   }
 
   Future<int> _contentLength(
@@ -380,24 +407,27 @@ class UrlParserMp4 implements UrlParser {
       });
     }
     Response response = await client.headUri(uri);
-    // Get content-length from content-range, if failed get from content-length
-    String? contentRange = response.headers.value(
-      HttpHeaders.contentRangeHeader,
-    );
-    if (contentRange != null) {
-      final match = RegExp(r'bytes (\d+)-(\d+)/(\d+)').firstMatch(contentRange);
-      if (match != null && match.group(3) != null) {
-        String total = match.group(3)!;
-        if (total.isNotEmpty && total != '0') {
-          return int.parse(total);
+    try {
+      // Get content-length from content-range, if failed get from content-length
+      String? contentRange = response.headers.value(
+        HttpHeaders.contentRangeHeader,
+      );
+      if (contentRange != null) {
+        final match = RegExp(r'bytes (\d+)-(\d+)/(\d+)').firstMatch(contentRange);
+        if (match != null && match.group(3) != null) {
+          String total = match.group(3)!;
+          if (total.isNotEmpty && total != '0') {
+            return int.parse(total);
+          }
         }
       }
+      String? contentLength = response.headers.value(
+        HttpHeaders.contentLengthHeader,
+      );
+      return int.tryParse(contentLength ?? '-1') ?? -1;
+    } finally {
+      client.close();
     }
-    String? contentLength = response.headers.value(
-      HttpHeaders.contentLengthHeader,
-    );
-    client.close();
-    return int.tryParse(contentLength ?? '-1') ?? -1;
   }
 
   Future<void> _cacheContentLength(
