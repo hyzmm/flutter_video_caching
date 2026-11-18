@@ -23,9 +23,11 @@ class VideoCaching {
   static Future<void> parse(
     Socket socket,
     Uri uri,
-    Map<String, String> headers,
-  ) async {
-    await UrlParserFactory.createParser(uri).parse(socket, uri, headers);
+    Map<String, String> headers, {
+    bool isHead = false,
+  }) async {
+    await UrlParserFactory.createParser(uri)
+        .parse(socket, uri, headers, isHead: isHead);
   }
 
   /// Whether the video is cached.
@@ -106,8 +108,11 @@ class VideoCaching {
     Uri uri = url.toSafeUri();
     UrlParser parser = UrlParserFactory.createParser(uri);
     if (parser is! UrlParserM3U8) return null;
-    HlsPlaylist? playlist = await parser.parsePlaylist(uri,
-        headers: headers, hlsKey: uri.generateMd5);
+    HlsPlaylist? playlist = await parser.parsePlaylist(
+      uri,
+      headers: headers,
+      hlsKey: uri.generateMd5,
+    );
     return playlist is HlsMasterPlaylist ? playlist : null;
   }
 }

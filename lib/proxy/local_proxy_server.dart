@@ -156,13 +156,20 @@ class LocalProxyServer {
 
         // Convert the path to a Uri object.
         Uri originUri = path.toOriginUri();
-        logD('Handling Connections ========================================> \n'
-            'protocol: $protocol, method: $method, path: $path \n'
-            'headers: $headers \n'
-            '$originUri');
+        logD(
+          'Handling Connections ========================================> \n'
+          'protocol: $protocol, method: $method, path: $path \n'
+          'headers: $headers \n'
+          '$originUri',
+        );
 
         // Delegate request handling to VideoCaching.
-        await VideoCaching.parse(socket, originUri, headers);
+        await VideoCaching.parse(
+          socket,
+          originUri,
+          headers,
+          isHead: method.toUpperCase() == 'HEAD',
+        );
       }
     } catch (e) {
       logW('⚠ ⚠ ⚠ Socket connections close: $e');
@@ -178,7 +185,7 @@ class LocalProxyServer {
     final String headers = <String>[
       'HTTP/1.1 400 Bad Request',
       'Content-Type: text/plain',
-      'Bad Request'
+      'Bad Request',
     ].join(httpTerminal);
     await socket.append(headers);
   }

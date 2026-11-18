@@ -71,8 +71,9 @@ class UrlParserM3U8 implements UrlParser {
   Future<bool> parse(
     Socket socket,
     Uri uri,
-    Map<String, String> headers,
-  ) async {
+    Map<String, String> headers, {
+    bool isHead = false,
+  }) async {
     try {
       DownloadTask task = DownloadTask(
         uri: uri,

@@ -16,6 +16,7 @@ import '../ext/string_ext.dart';
 import '../ext/uri_ext.dart';
 import '../global/config.dart';
 import '../proxy/video_proxy.dart';
+import 'byte_range_header.dart';
 import 'url_parser.dart';
 
 /// MP4 URL parser implementation.
@@ -78,23 +79,15 @@ class UrlParserMp4 implements UrlParser {
   Future<bool> parse(
     Socket socket,
     Uri uri,
-    Map<String, String> headers,
-  ) async {
+    Map<String, String> headers, {
+    bool isHead = false,
+  }) async {
     try {
-      // Implementation for parsing and responding to HTTP range requests.
-      // Handles both Android and iOS platforms.
-      RegExp exp = RegExp(r'bytes=(\d+)-(\d*)');
-      RegExpMatch? rangeMatch = exp.firstMatch(headers['range'] ?? '');
-      int requestRangeStart = int.tryParse(rangeMatch?.group(1) ?? '0') ?? 0;
-      int requestRangeEnd = int.tryParse(rangeMatch?.group(2) ?? '0') ?? -1;
-      // Any request carrying a Range header must be answered with 206. iOS
-      // AVPlayer may request `Range: bytes=0-` for normal startup; the previous
-      // `start > 0 || end > 0` check returned 200 for `bytes=0-`, which makes
-      // the proxy look non-range-capable (delaying startup) and makes
-      // ffmpeg/libmpv treat the stream as non-seekable (is_streamed=1): seeking
-      // jumps to EOF and, when moov sits at the tail, the final frames decode as
-      // garbage.
-      bool partial = rangeMatch != null;
+      // Windows Media Foundation sends `Range: -` while probing a URL. It is
+      // not a valid byte range and must be answered like a plain request,
+      // otherwise the player receives a tiny body and drops the source.
+      final range = ByteRangeHeader.parse(headers['range']);
+      final partial = range.isPartial;
       List<String> responseHeaders = <String>[
         partial ? 'HTTP/1.1 206 Partial Content' : 'HTTP/1.1 200 OK',
         'Accept-Ranges: bytes',
@@ -106,19 +99,18 @@ class UrlParserMp4 implements UrlParser {
           socket,
           uri,
           responseHeaders,
-          requestRangeStart,
-          requestRangeEnd,
+          range,
           headers,
+          isHead: isHead,
         );
       } else {
         await parseIOS(
           socket,
           uri,
           responseHeaders,
-          requestRangeStart,
-          requestRangeEnd,
-          partial,
+          range,
           headers,
+          isHead: isHead,
         );
       }
       await socket.flush();
@@ -141,39 +133,26 @@ class UrlParserMp4 implements UrlParser {
     Socket socket,
     Uri uri,
     List<String> responseHeaders,
-    int requestRangeStart,
-    int requestRangeEnd,
-    Map<String, String> headers,
-  ) async {
+    ByteRangeHeader range,
+    Map<String, String> headers, {
+    bool isHead = false,
+  }) async {
     // Start the first segment before the HEAD round-trip so the two overlap;
     // otherwise the player waits an extra origin RTT before any byte arrives.
-    await _warmFirstSegment(uri, headers, requestRangeStart);
-    DownloadTask task = DownloadTask(
-      uri: uri,
-      startRange: 0,
-      endRange: 1,
-      headers: headers,
-    );
-    Uint8List? data = await cache(task);
-    int contentLength = 0;
-    if (data != null) {
-      contentLength = int.tryParse(Utf8Codec().decode(data)) ?? 0;
-    }
-    if (contentLength == 0) {
-      contentLength = await head(uri, headers: headers);
-      await _cacheContentLength(task, contentLength);
-    }
+    await _warmFirstSegment(uri, headers, range.start ?? 0);
+    final contentLength = await _contentLength(uri, headers);
+    final rangeResponse = _resolveRangeResponse(range, contentLength);
 
-    requestRangeEnd = contentLength - 1;
-    responseHeaders.add('content-length: ${contentLength - requestRangeStart}');
-    responseHeaders.add(
-      'content-range: bytes '
-      '$requestRangeStart-$requestRangeEnd/$contentLength',
-    );
+    if (!rangeResponse.partial) responseHeaders[0] = 'HTTP/1.1 200 OK';
+    responseHeaders.add('content-length: ${rangeResponse.contentLength}');
+    if (rangeResponse.contentRangeHeader != null) {
+      responseHeaders.add(rangeResponse.contentRangeHeader!);
+    }
     await socket.append(responseHeaders.join('\r\n'));
+    if (isHead) return;
 
     bool downloading = true;
-    int startRange = Config.segmentStartOf(requestRangeStart);
+    int startRange = Config.segmentStartOf(rangeResponse.start);
     int endRange = Config.segmentEndOf(startRange) - 1;
     int retry = 3;
     while (downloading) {
@@ -181,9 +160,8 @@ class UrlParserMp4 implements UrlParser {
       // the requested range end is past EOF, some origins (e.g. Aliyun OSS) reply
       // 200 + the whole file instead of a clamped 206; the serve loop then
       // splices the file's head where its tail belongs, corrupting playback
-      // around the segment boundary (jump to EOF). requestRangeEnd is the file's
-      // last byte here (contentLength-1), so clamp to it.
-      if (endRange > requestRangeEnd) endRange = requestRangeEnd;
+      // around the segment boundary (jump to EOF).
+      if (endRange > rangeResponse.end) endRange = rangeResponse.end;
       DownloadTask task = DownloadTask(
         uri: uri,
         startRange: startRange,
@@ -224,23 +202,25 @@ class UrlParserMp4 implements UrlParser {
 
       int startIndex = 0;
       int? endIndex;
-      if (startRange < requestRangeStart) {
-        startIndex = requestRangeStart - startRange;
+      if (startRange < rangeResponse.start) {
+        startIndex = rangeResponse.start - startRange;
       }
-      if (endRange > requestRangeEnd) {
-        endIndex = requestRangeEnd - startRange + 1;
+      if (endRange > rangeResponse.end) {
+        endIndex = rangeResponse.end - startRange + 1;
       }
       data = data.sublist(startIndex, endIndex);
-      socket.done.then((value) {
-        downloading = false;
-      }).catchError((e) {
-        downloading = false;
-      });
+      socket.done
+          .then((value) {
+            downloading = false;
+          })
+          .catchError((e) {
+            downloading = false;
+          });
       bool success = await socket.append(data);
       if (!success) downloading = false;
       startRange = Config.segmentEndOf(startRange);
       endRange = Config.segmentEndOf(startRange) - 1;
-      if (startRange > requestRangeEnd) {
+      if (startRange > rangeResponse.end) {
         downloading = false;
       }
     }
@@ -253,24 +233,20 @@ class UrlParserMp4 implements UrlParser {
     Socket socket,
     Uri uri,
     List<String> responseHeaders,
-    int requestRangeStart,
-    int requestRangeEnd,
-    bool partial,
-    Map<String, String> headers,
-  ) async {
-    await _warmFirstSegment(uri, headers, requestRangeStart);
+    ByteRangeHeader range,
+    Map<String, String> headers, {
+    bool isHead = false,
+  }) async {
+    await _warmFirstSegment(uri, headers, range.start ?? 0);
     final totalContentLength = await _contentLength(uri, headers);
-    final rangeResponse = Mp4RangeResponse.fromRequest(
-      start: requestRangeStart,
-      end: requestRangeEnd,
-      totalLength: totalContentLength,
-      partial: partial,
-    );
+    final rangeResponse = _resolveRangeResponse(range, totalContentLength);
+    if (!rangeResponse.partial) responseHeaders[0] = 'HTTP/1.1 200 OK';
     responseHeaders.add('content-length: ${rangeResponse.contentLength}');
     if (rangeResponse.contentRangeHeader != null) {
       responseHeaders.add(rangeResponse.contentRangeHeader!);
     }
     await socket.append(responseHeaders.join('\r\n'));
+    if (isHead) return;
 
     bool downloading = true;
     int startRange = Config.segmentStartOf(rangeResponse.start);
@@ -328,11 +304,13 @@ class UrlParserMp4 implements UrlParser {
         endIndex = rangeResponse.end - startRange + 1;
       }
       data = data.sublist(startIndex, endIndex);
-      socket.done.then((value) {
-        downloading = false;
-      }).catchError((e) {
-        downloading = false;
-      });
+      socket.done
+          .then((value) {
+            downloading = false;
+          })
+          .catchError((e) {
+            downloading = false;
+          });
       bool success = await socket.append(data);
       if (!success) downloading = false;
       startRange = Config.segmentEndOf(startRange);
@@ -341,6 +319,31 @@ class UrlParserMp4 implements UrlParser {
         downloading = false;
       }
     }
+  }
+
+  /// Resolves a parsed range against the real file length.
+  ///
+  /// Unsatisfiable or malformed ranges fall back to the whole resource with a
+  /// `200`, which is what Windows Media Foundation expects for `Range: -`.
+  Mp4RangeResponse _resolveRangeResponse(
+    ByteRangeHeader range,
+    int totalLength,
+  ) {
+    final resolved = range.resolve(totalLength);
+    if (resolved == null) {
+      return Mp4RangeResponse(
+        start: 0,
+        end: totalLength - 1,
+        totalLength: totalLength,
+        partial: false,
+      );
+    }
+    return Mp4RangeResponse(
+      start: resolved.$1,
+      end: resolved.$2,
+      totalLength: totalLength,
+      partial: range.isPartial,
+    );
   }
 
   /// Submits the segment containing [requestRangeStart] for download unless it
@@ -366,10 +369,7 @@ class UrlParserMp4 implements UrlParser {
     unawaited(VideoProxy.downloadManager.executeTask(task));
   }
 
-  Future<int> _contentLength(
-    Uri uri,
-    Map<String, String> headers,
-  ) async {
+  Future<int> _contentLength(Uri uri, Map<String, String> headers) async {
     // Store content length in the existing first-segment metadata slot. Range
     // normalization and tail clamping both need total length, and avoiding a
     // HEAD on every iOS `bytes=0-` request keeps startup cheap.
@@ -411,7 +411,8 @@ class UrlParserMp4 implements UrlParser {
         HttpHeaders.contentRangeHeader,
       );
       if (contentRange != null) {
-        final match = RegExp(r'bytes (\d+)-(\d+)/(\d+)').firstMatch(contentRange);
+        final match = RegExp(r'bytes (\d+)-(\d+)/(\d+)')
+            .firstMatch(contentRange);
         if (match != null && match.group(3) != null) {
           String total = match.group(3)!;
           if (total.isNotEmpty && total != '0') {
@@ -428,14 +429,12 @@ class UrlParserMp4 implements UrlParser {
     }
   }
 
-  Future<void> _cacheContentLength(
-    DownloadTask task,
-    int contentLength,
-  ) async {
+  Future<void> _cacheContentLength(DownloadTask task, int contentLength) async {
     try {
       // Content length is already known by the caller. This small metadata file
       // only speeds up later requests, so failures must not block the response.
-      String filePath = '${await FileExt.createCachePath(task.uri.generateMd5)}'
+      String filePath =
+          '${await FileExt.createCachePath(task.uri.generateMd5)}'
           '/${task.saveFileName}';
       File file = File(filePath);
       await file.writeAsString(contentLength.toString());
@@ -555,12 +554,13 @@ class UrlParserMp4 implements UrlParser {
   /// Returns a [StreamController] emitting progress maps, or `null` if not listening.
   @override
   Future<StreamController<Map>?> precache(
-      String url,
-      Map<String, Object>? headers,
-      int cacheSegments,
-      bool downloadNow,
-      bool progressListen,
-      [int priority = 1]) async {
+    String url,
+    Map<String, Object>? headers,
+    int cacheSegments,
+    bool downloadNow,
+    bool progressListen, [
+    int priority = 1,
+  ]) async {
     StreamController<Map>? _streamController;
     if (progressListen) _streamController = StreamController();
     final uri = url.toSafeUri();

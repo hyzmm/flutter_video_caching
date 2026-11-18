@@ -16,6 +16,7 @@ import '../ext/string_ext.dart';
 import '../ext/uri_ext.dart';
 import '../global/config.dart';
 import '../proxy/video_proxy.dart';
+import 'byte_range_header.dart';
 import 'url_parser.dart';
 
 /// Default URL parser implementation.
@@ -79,16 +80,14 @@ class UrlParserDefault implements UrlParser {
   Future<bool> parse(
     Socket socket,
     Uri uri,
-    Map<String, String> headers,
-  ) async {
+    Map<String, String> headers, {
+    bool isHead = false,
+  }) async {
     try {
-      // Implementation for parsing and responding to HTTP range requests.
-      // Handles both Android and iOS platforms.
-      RegExp exp = RegExp(r'bytes=(\d+)-(\d*)');
-      RegExpMatch? rangeMatch = exp.firstMatch(headers['range'] ?? '');
-      int requestRangeStart = int.tryParse(rangeMatch?.group(1) ?? '0') ?? 0;
-      int requestRangeEnd = int.tryParse(rangeMatch?.group(2) ?? '0') ?? -1;
-      bool partial = requestRangeStart > 0 || requestRangeEnd > 0;
+      final range = ByteRangeHeader.parse(headers['range']);
+      final partial = range.isPartial;
+      int requestRangeStart = range.start ?? 0;
+      int requestRangeEnd = range.end ?? -1;
       List<String> responseHeaders = <String>[
         partial ? 'HTTP/1.1 206 Partial Content' : 'HTTP/1.1 200 OK',
         'Accept-Ranges: bytes',
@@ -103,6 +102,7 @@ class UrlParserDefault implements UrlParser {
           requestRangeStart,
           requestRangeEnd,
           headers,
+          isHead: isHead,
         );
       } else {
         await parseIOS(
@@ -112,6 +112,7 @@ class UrlParserDefault implements UrlParser {
           requestRangeStart,
           requestRangeEnd,
           headers,
+          isHead: isHead,
         );
       }
       await socket.flush();
@@ -136,8 +137,9 @@ class UrlParserDefault implements UrlParser {
     List<String> responseHeaders,
     int requestRangeStart,
     int requestRangeEnd,
-    Map<String, String> headers,
-  ) async {
+    Map<String, String> headers, {
+    bool isHead = false,
+  }) async {
     DownloadTask task = DownloadTask(
       uri: uri,
       startRange: 0,
@@ -161,6 +163,7 @@ class UrlParserDefault implements UrlParser {
       '$requestRangeStart-$requestRangeEnd/$contentLength',
     );
     await socket.append(responseHeaders.join('\r\n'));
+    if (isHead) return;
 
     bool downloading = true;
     int startRange =
@@ -236,8 +239,9 @@ class UrlParserDefault implements UrlParser {
     List<String> responseHeaders,
     int requestRangeStart,
     int requestRangeEnd,
-    Map<String, String> headers,
-  ) async {
+    Map<String, String> headers, {
+    bool isHead = false,
+  }) async {
     if ((requestRangeStart == 0 && requestRangeEnd == 1) ||
         requestRangeEnd == -1) {
       DownloadTask task = DownloadTask(
@@ -258,7 +262,7 @@ class UrlParserDefault implements UrlParser {
       if (requestRangeStart == 0 && requestRangeEnd == 1) {
         responseHeaders.add('content-range: bytes 0-1/$contentLength');
         await socket.append(responseHeaders.join('\r\n'));
-        await socket.append([0]);
+        if (!isHead) await socket.append([0]);
         await socket.close();
         return;
       } else if (requestRangeEnd == -1) {
@@ -269,6 +273,7 @@ class UrlParserDefault implements UrlParser {
     int contentLength = requestRangeEnd - requestRangeStart + 1;
     responseHeaders.add('content-length: $contentLength');
     await socket.append(responseHeaders.join('\r\n'));
+    if (isHead) return;
 
     bool downloading = true;
     int startRange =
@@ -368,10 +373,7 @@ class UrlParserDefault implements UrlParser {
     return int.tryParse(contentLength ?? '-1') ?? -1;
   }
 
-  Future<void> _cacheContentLength(
-    DownloadTask task,
-    int contentLength,
-  ) async {
+  Future<void> _cacheContentLength(DownloadTask task, int contentLength) async {
     try {
       // Content length is already known by the caller. This small metadata file
       // only speeds up later requests, so failures must not block the response.
@@ -467,12 +469,13 @@ class UrlParserDefault implements UrlParser {
   /// Returns a [StreamController] emitting progress maps, or `null` if not listening.
   @override
   Future<StreamController<Map>?> precache(
-      String url,
-      Map<String, Object>? headers,
-      int cacheSegments,
-      bool downloadNow,
-      bool progressListen,
-      [int priority = 1]) async {
+    String url,
+    Map<String, Object>? headers,
+    int cacheSegments,
+    bool downloadNow,
+    bool progressListen, [
+    int priority = 1,
+  ]) async {
     StreamController<Map>? _streamController;
     if (progressListen) _streamController = StreamController();
     int contentLength = await head(url.toSafeUri(), headers: headers);

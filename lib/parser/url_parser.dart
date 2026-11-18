@@ -26,7 +26,15 @@ abstract class UrlParser {
   /// Parses data from the given [socket] using the specified [uri] and [headers].
   ///
   /// Returns `true` if parsing is successful, otherwise `false`.
-  Future<bool> parse(Socket socket, Uri uri, Map<String, String> headers);
+  ///
+  /// [isHead] suppresses the body while keeping the same headers, so a `HEAD`
+  /// probe gets the real content length without transferring the resource.
+  Future<bool> parse(
+    Socket socket,
+    Uri uri,
+    Map<String, String> headers, {
+    bool isHead = false,
+  });
 
   /// Whether the video is cached.
   ///
@@ -53,10 +61,11 @@ abstract class UrlParser {
   /// Returns a [StreamController] that emits progress or status updates,
   /// or `null` if precaching is not supported.
   Future<StreamController<Map>?> precache(
-      String url,
-      Map<String, Object>? headers,
-      int cacheSegments,
-      bool downloadNow,
-      bool progressListen,
-      [int priority = 1]);
+    String url,
+    Map<String, Object>? headers,
+    int cacheSegments,
+    bool downloadNow,
+    bool progressListen, [
+    int priority = 1,
+  ]);
 }
